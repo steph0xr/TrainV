@@ -15,13 +15,61 @@
 
 static const char *TAG = "Train";
 
-#define EXAMPLE_PCNT_HIGH_LIMIT 10000
-#define EXAMPLE_PCNT_LOW_LIMIT  -10000
+#define EXAMPLE_PCNT_HIGH_LIMIT 30000
+#define EXAMPLE_PCNT_LOW_LIMIT  -30000
 
 #define EXAMPLE_EC11_GPIO_A 25
 #define EXAMPLE_EC11_GPIO_B 26
 
 static pcnt_unit_handle_t pcnt_unit = NULL;
+
+struct dev_config {
+        int dt;
+        int count_mt_coeff;
+        int reset_timeout_seconds;
+        int movement_tolerance_pulses; 
+};
+
+struct dev_state {
+        int pulse_count;
+        int last_pulse_count;
+        int event_count;
+        int dp; 
+        int stability_count;
+        float abs_s; 
+        float rep_start_s; 
+        float v; 
+        float max_v_pos; 
+        float max_v_neg; 
+        float ds; 
+        float rep_rom; 
+        float max_neg_s;
+        bool rep_ongoing;
+};
+
+static const struct dev_config cfg = {
+        .dt = 100,                      //ms
+        .count_mt_coeff = 230*10,       // 200 count are 10 cm
+        .reset_timeout_seconds = 4,
+        .movement_tolerance_pulses = 3, 
+};
+
+static struct dev_state state = {
+        .pulse_count = 0,
+        .last_pulse_count = 0,
+        .event_count = 0,
+        .dp = 0, 
+        .stability_count = 0,
+        .abs_s = 0, 
+        .rep_start_s = 0, 
+        .v = 0, 
+        .max_v_pos = 0, 
+        .max_v_neg = 0, 
+        .ds = 0, 
+        .rep_rom = 0, 
+        .max_neg_s = 0,
+        .rep_ongoing = false,
+};
 
 static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
 {
@@ -94,6 +142,109 @@ QueueHandle_t init_encoder()
         return queue;
 }
 
+bool is_in_movement()
+{
+        bool mov;
+
+        mov = state.last_pulse_count >= 
+               state.pulse_count + cfg.movement_tolerance_pulses ||
+               state.last_pulse_count <= 
+               state.pulse_count - cfg.movement_tolerance_pulses; 
+
+        return mov;
+}
+
+bool is_stable()
+{
+        return state.rep_ongoing && state.stability_count > (cfg.reset_timeout_seconds * 1000/cfg.dt);
+}
+
+void reset_state()
+{
+        state.stability_count = 0;
+        state.max_v_neg = 0;
+        state.max_v_pos = 0;
+        state.max_neg_s = 0;
+}
+
+void print_results()
+{
+        printf("\n");
+        ESP_LOGI(TAG, "Rep closed");
+        ESP_LOGI(TAG, "start point %.3f m", state.rep_start_s);
+        ESP_LOGI(TAG, "end point %.3f m", state.max_neg_s);
+        ESP_LOGI(TAG, "ROM %.3f m", state.rep_rom);
+        ESP_LOGI(TAG, "Max Speed Negative = %.3f m/s", state.max_v_neg);
+        ESP_LOGI(TAG, "Max Speed Positive = %.3f m/s", state.max_v_pos);
+        printf("\n");
+        printf("\n");
+        ESP_LOGI(TAG, "Stable condition.");
+        ESP_LOGI(TAG, "Speed and ROM reset");
+}
+
+void check_if_new_max_speed_reached()
+{
+        if (state.ds < 0)
+                if (state.v < state.max_v_neg) {
+                        /* ESP_LOGD(TAG, "new max speed negative %.3f", v); */
+                        state.max_v_neg = state.v;
+                }
+
+        if (state.ds > 0)
+                if (state.v > state.max_v_pos) {
+                        /* ESP_LOGD(TAG, "new max speed positive %.3f", v); */
+                        state.max_v_pos = state.v;
+                }
+}
+
+void speed_evaluation()
+{
+        state.dp = state.pulse_count - state.last_pulse_count;
+        state.ds = (float) state.dp / (float) cfg.count_mt_coeff;
+        state.v = (float) state.ds / ((float) cfg.dt / 1000); 
+
+        check_if_new_max_speed_reached();
+}
+
+
+void periodic_pulse_count_evaluation()
+{
+        state.last_pulse_count = state.pulse_count;
+        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &state.pulse_count));
+
+        if (is_in_movement()) {
+                state.rep_ongoing = true;
+                state.abs_s = (float) state.pulse_count / (float) cfg.count_mt_coeff;
+
+                ESP_LOGD(TAG, "ROM = %.3f mt   [pulse count %d]", state.abs_s, state.pulse_count);
+
+                if (state.abs_s < state.max_neg_s)
+                        state.max_neg_s = state.abs_s;
+
+                state.stability_count = 0;
+
+        } else {
+                state.stability_count++;
+
+                if (is_stable()) {               // is stable for enougth time
+                        state.rep_rom = state.max_neg_s - state.rep_start_s;
+
+                        print_results();
+
+                        reset_state();
+
+                        state.rep_start_s = state.abs_s;
+
+                        ESP_LOGI(TAG, "new starting point %.3f m", state.rep_start_s);
+
+                        state.rep_ongoing = false;
+                }
+
+        }
+
+        speed_evaluation();
+}
+
 
 
 void app_main(void)
@@ -102,79 +253,13 @@ void app_main(void)
 
         /* esp_log_level_set(TAG, ESP_LOG_DEBUG); */
 
-        // Report counter value
-        int pulse_count = 0;
-        int last_pulse_count = 0;
-        int event_count = 0;
-        int dt = 100; //ms
-        int count_mt_coeff = 230*10;               // 200 count sono 10 cm
-        int dp, stability_count = 0;
-        float abs_s, rep_start_s, v, max_v_pos = 0, max_v_neg = 0, ds, rep_rom, max_neg_s = 0;
-
-        int reset_timeout_seconds = 4;
-        int movement_tolerance_pulses = 5; 
-        bool rep_ongoing = false;
-
+        ESP_LOGI(TAG, "ready to rock!");
 
         while (1) {
-                if (xQueueReceive(queue, &event_count, pdMS_TO_TICKS(dt))) {
+                if (xQueueReceive(queue, &state.event_count, pdMS_TO_TICKS(cfg.dt))) {
                         /* ESP_LOGD(TAG, "Watch point event, count: %d", event_count); */
                 } else {
-                        last_pulse_count = pulse_count;
-                        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
-
-                        // print ROM
-                        if (last_pulse_count >= pulse_count + movement_tolerance_pulses ||                // isMovement
-                            last_pulse_count <= pulse_count - movement_tolerance_pulses ) {
-                                rep_ongoing = true;
-                                abs_s = (float) pulse_count / (float) count_mt_coeff;
-                                ESP_LOGD(TAG, "ROM = %.3f mt   [pulse count %d]", abs_s, pulse_count);
-
-                                if (abs_s < max_neg_s)
-                                        max_neg_s = abs_s;
-
-                                stability_count = 0;
-                        } else {
-                                stability_count++;
-                                if (rep_ongoing && stability_count > (reset_timeout_seconds * 1000/dt)) {               // isStable for enougth time
-                                        rep_rom = max_neg_s - rep_start_s;
-                                        printf("\n");
-                                        ESP_LOGI(TAG, "Rep closed");
-                                        ESP_LOGI(TAG, "start point %.3f m", rep_start_s);
-                                        ESP_LOGI(TAG, "end point %.3f m", max_neg_s);
-                                        ESP_LOGI(TAG, "ROM %.3f m", rep_rom);
-                                        ESP_LOGI(TAG, "Max Speed Negative = %.3f m/s", max_v_neg);
-                                        ESP_LOGI(TAG, "Max Speed Positive = %.3f m/s", max_v_pos);
-                                        printf("\n");
-                                        printf("\n");
-                                        ESP_LOGI(TAG, "Stable condition.");
-                                        ESP_LOGI(TAG, "Speed and ROM reset");
-                                        stability_count = 0;
-                                        max_v_neg = 0;
-                                        max_v_pos = 0;
-                                        max_neg_s = 0;
-                                        rep_start_s = abs_s;
-                                        ESP_LOGI(TAG, "new starting point %.3f m", rep_start_s);
-                                        rep_ongoing = false;
-                                }
-                                
-                        }
-
-                        // speed eval
-                        dp = pulse_count - last_pulse_count;
-                        ds = (float) dp / (float) count_mt_coeff;
-                        v = (float) ds / ((float) dt / 1000); 
-                        if (ds < 0)
-                                if (v < max_v_neg) {
-                                        /* ESP_LOGD(TAG, "new max speed negative %.3f", v); */
-                                        max_v_neg = v;
-                                }
-
-                        if (ds > 0)
-                                if (v > max_v_pos) {
-                                        /* ESP_LOGD(TAG, "new max speed positive %.3f", v); */
-                                        max_v_pos = v;
-                                }
+                        periodic_pulse_count_evaluation();
                 }
         }
 }
