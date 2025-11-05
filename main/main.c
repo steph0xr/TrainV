@@ -13,7 +13,7 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 
-static const char *TAG = "Train";
+static const char *TAG = "dev";
 
 #define EXAMPLE_PCNT_HIGH_LIMIT 30000
 #define EXAMPLE_PCNT_LOW_LIMIT  -30000
@@ -49,7 +49,7 @@ struct dev_state {
 
 static const struct dev_config cfg = {
         .dt = 100,                      //ms
-        .count_mt_coeff = 230*10,       // 200 count are 10 cm
+        .count_mt_coeff = 333*10,       // 200 count are 10 cm
         .reset_timeout_seconds = 4,
         .movement_tolerance_pulses = 3, 
 };
