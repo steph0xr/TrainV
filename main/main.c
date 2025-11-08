@@ -13,6 +13,9 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 
+#include <math.h>
+#include "esp_timer.h"
+
 static const char *TAG = "dev";
 
 #define EXAMPLE_PCNT_HIGH_LIMIT 30000
@@ -21,6 +24,8 @@ static const char *TAG = "dev";
 #define EXAMPLE_EC11_GPIO_A 25
 #define EXAMPLE_EC11_GPIO_B 26
 
+#define MAX_REPS 50
+
 static pcnt_unit_handle_t pcnt_unit = NULL;
 
 struct dev_config {
@@ -28,6 +33,7 @@ struct dev_config {
         int count_mt_coeff;
         int reset_timeout_seconds;
         int movement_tolerance_pulses; 
+        float last_rep_speed_threshold;
 };
 
 struct dev_state {
@@ -35,6 +41,7 @@ struct dev_state {
         int last_pulse_count;
         int event_count;
         int dp; 
+        int last_dp; 
         int stability_count;
         float abs_s; 
         float rep_start_s; 
@@ -44,7 +51,12 @@ struct dev_state {
         float ds; 
         float rep_rom; 
         float max_neg_s;
+        int reps_n;
+        bool series_ongoing;
         bool rep_ongoing;
+        bool direction_switched;
+        float reps_speed[MAX_REPS];
+        int64_t ms_start;
 };
 
 static const struct dev_config cfg = {
@@ -52,6 +64,7 @@ static const struct dev_config cfg = {
         .count_mt_coeff = 333*10,       // 200 count are 10 cm
         .reset_timeout_seconds = 4,
         .movement_tolerance_pulses = 3, 
+        .last_rep_speed_threshold = 0.025,         //m/s
 };
 
 static struct dev_state state = {
@@ -59,6 +72,7 @@ static struct dev_state state = {
         .last_pulse_count = 0,
         .event_count = 0,
         .dp = 0, 
+        .last_dp = 0, 
         .stability_count = 0,
         .abs_s = 0, 
         .rep_start_s = 0, 
@@ -68,7 +82,10 @@ static struct dev_state state = {
         .ds = 0, 
         .rep_rom = 0, 
         .max_neg_s = 0,
+        .series_ongoing = false,
         .rep_ongoing = false,
+        .reps_n = 0,
+        .direction_switched = false,
 };
 
 static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
@@ -156,15 +173,17 @@ bool is_in_movement()
 
 bool is_stable()
 {
-        return state.rep_ongoing && state.stability_count > (cfg.reset_timeout_seconds * 1000/cfg.dt);
+        return state.series_ongoing && state.stability_count > (cfg.reset_timeout_seconds * 1000/cfg.dt);
 }
 
 void reset_state()
 {
+        ESP_LOGI(TAG, "Speed and ROM reset");
         state.stability_count = 0;
         state.max_v_neg = 0;
         state.max_v_pos = 0;
         state.max_neg_s = 0;
+        state.reps_n = 0;
 }
 
 void print_results()
@@ -179,28 +198,107 @@ void print_results()
         printf("\n");
         printf("\n");
         ESP_LOGI(TAG, "Stable condition.");
-        ESP_LOGI(TAG, "Speed and ROM reset");
+}
+
+void evaluate_speed_decrement()
+{
+        float last_speed_decrement,
+              decrement_from_start;
+
+        if (state.reps_n < 2)
+                return;  // not enought elements to evaluate decrement 
+
+        int idx = state.reps_n - 1;
+
+        last_speed_decrement = ( 100 * state.reps_speed[idx] / state.reps_speed[idx - 1] ) - 100;
+
+        decrement_from_start = ( 100 * state.reps_speed[idx] / state.reps_speed[0] ) - 100;
+
+        ESP_LOGI(TAG, "speed decrement -> last: %d %%, from start: %d %%", 
+                 (int)last_speed_decrement, (int)decrement_from_start);
+        
+        if (state.reps_speed[state.reps_n] <= cfg.last_rep_speed_threshold)
+                ESP_LOGW(TAG, 
+                         "LOW SPEED LIMIT REACHED (%.3f (limit:%.3f) m/s)", 
+                         state.reps_speed[state.reps_n], 
+                         cfg.last_rep_speed_threshold);
+}
+
+void print_rep_speed_array()
+{
+        printf("[ ");
+        for (int i = 0; i < state.reps_n; i++) { 
+                printf("%.3f ", state.reps_speed[i]); 
+        }
+        printf("]\n");
+}
+
+void store_rep_speed(int rep, float v) 
+{
+        state.reps_speed[rep - 1] = v;
+        print_rep_speed_array();
+        evaluate_speed_decrement();
 }
 
 void check_if_new_max_speed_reached()
 {
-        if (state.ds < 0)
-                if (state.v < state.max_v_neg) {
-                        /* ESP_LOGD(TAG, "new max speed negative %.3f", v); */
-                        state.max_v_neg = state.v;
+        ESP_LOGD(TAG, "ds: %.3f, dp: %d, pulse: %d, last pulse: %d", 
+                 state.ds, state.dp, state.pulse_count, state.last_pulse_count);
+
+        if (state.dp < 0 &&
+            abs(state.dp) > cfg.movement_tolerance_pulses) {
+                if (state.direction_switched) {
+                        /* ESP_LOGD(TAG, "new max speed negative %.3f", state.v); */
+                        state.reps_n++;
+                        state.ms_start = esp_timer_get_time() / 1000;
                 }
 
-        if (state.ds > 0)
+                state.rep_ongoing = true;
+
+                if (state.v < state.max_v_neg) {
+                        state.max_v_neg = state.v;
+                }
+        }
+
+        if (state.dp > 0 && 
+            abs(state.dp) > cfg.movement_tolerance_pulses) {
+                if (state.direction_switched) {
+                        ESP_LOGI(TAG, "rep n.%d speed: %.3f", state.reps_n, state.v);
+                        state.rep_rom = state.max_neg_s - state.rep_start_s;
+                        int64_t ms_end = esp_timer_get_time() / 1000;
+                        int64_t delta_t =  ms_end - state.ms_start;
+                        float v = state.rep_rom / delta_t;
+                        store_rep_speed(state.reps_n, v);
+                }
+
+                state.rep_ongoing = false;
+
                 if (state.v > state.max_v_pos) {
                         /* ESP_LOGD(TAG, "new max speed positive %.3f", v); */
                         state.max_v_pos = state.v;
                 }
+        }
+}
+
+void evaluate_direction_switched()
+{
+        if ((state.last_dp <= 0 && state.dp > 0) || 
+            (state.last_dp >= 0 && state.dp < 0)) {
+                state.direction_switched = true;
+                ESP_LOGD(TAG, "direction switched. last dp: %d, dp: %d",
+                         state.last_dp, state.dp);
+        } else 
+                state.direction_switched = false;
 }
 
 void speed_evaluation()
 {
+        state.last_dp = state.dp;
         state.dp = state.pulse_count - state.last_pulse_count;
         state.ds = (float) state.dp / (float) cfg.count_mt_coeff;
+
+        evaluate_direction_switched();
+
         state.v = (float) state.ds / ((float) cfg.dt / 1000); 
 
         check_if_new_max_speed_reached();
@@ -213,7 +311,9 @@ void periodic_pulse_count_evaluation()
         ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &state.pulse_count));
 
         if (is_in_movement()) {
-                state.rep_ongoing = true;
+                state.series_ongoing = true;
+                state.stability_count = 0;
+
                 state.abs_s = (float) state.pulse_count / (float) cfg.count_mt_coeff;
 
                 ESP_LOGD(TAG, "ROM = %.3f mt   [pulse count %d]", state.abs_s, state.pulse_count);
@@ -221,23 +321,16 @@ void periodic_pulse_count_evaluation()
                 if (state.abs_s < state.max_neg_s)
                         state.max_neg_s = state.abs_s;
 
-                state.stability_count = 0;
-
         } else {
                 state.stability_count++;
 
                 if (is_stable()) {               // is stable for enougth time
                         state.rep_rom = state.max_neg_s - state.rep_start_s;
-
                         print_results();
-
                         reset_state();
-
                         state.rep_start_s = state.abs_s;
-
                         ESP_LOGI(TAG, "new starting point %.3f m", state.rep_start_s);
-
-                        state.rep_ongoing = false;
+                        state.series_ongoing = false;
                 }
 
         }
@@ -251,9 +344,10 @@ void app_main(void)
 {
         QueueHandle_t queue = init_encoder();
 
-        /* esp_log_level_set(TAG, ESP_LOG_DEBUG); */
+        /* esp_log_level_set(TAG, ESP_LOG_INFO); */
+        esp_log_level_set(TAG, ESP_LOG_DEBUG);
 
-        ESP_LOGI(TAG, "ready to rock!");
+        ESP_LOGI(TAG, "\n\nReady to Rock!\n");
 
         while (1) {
                 if (xQueueReceive(queue, &state.event_count, pdMS_TO_TICKS(cfg.dt))) {
