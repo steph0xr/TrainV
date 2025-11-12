@@ -29,12 +29,12 @@ static const char *TAG = "dev";
 
 static pcnt_unit_handle_t pcnt_unit = NULL;
         
-/* static QueueHandle_t xQueue = NULL; */
-/*  */
-/* struct point { */
-        /* int64_t time; */
-        /* int pulse; */
-/* }; */
+static QueueHandle_t xQueue = NULL;
+
+typedef struct {
+        int pulse;
+        int64_t time;
+} point_t;
 
 struct dev_config {
         int dt;
@@ -73,7 +73,7 @@ struct dev_state {
 };
 
 static const struct dev_config cfg = {
-        .dt = 10,                      //ms
+        .dt = 3,                      //ms
         .count_mt_coeff = 333*10,       // 200 count are 10 cm
         .reset_timeout_seconds = 4,
         .movement_tolerance_pulses = 4, 
@@ -174,75 +174,6 @@ QueueHandle_t init_encoder()
         return queue;
 }
 
-bool is_in_movement()
-{
-        bool mov;
-
-        mov = state.last_pulse_count >= 
-               state.pulse_count + cfg.movement_tolerance_pulses ||
-               state.last_pulse_count <= 
-               state.pulse_count - cfg.movement_tolerance_pulses; 
-
-        return mov;
-}
-
-bool is_stable()
-{
-        return state.series_ongoing && state.stability_count > (cfg.reset_timeout_seconds * 1000/cfg.dt);
-}
-
-void reset_state()
-{
-        ESP_LOGI(TAG, "Speed and ROM reset");
-        state.stability_count = 0;
-        state.max_v_neg = 0;
-        state.max_v_pos = 0;
-        state.max_neg_s = 0;
-        state.reps_n = 0;
-        dir_detector_init(&(state.d), cfg.direction_hyst);
-        printf("reset dir detector: hyst: %d\n ", state.d.hysteresis);
-}
-
-void print_results()
-{
-        printf("\n");
-        ESP_LOGI(TAG, "Rep closed");
-        ESP_LOGI(TAG, "start point %.3f m", state.rep_start_s);
-        ESP_LOGI(TAG, "end point %.3f m", state.max_neg_s);
-        ESP_LOGI(TAG, "ROM %.3f m", state.rep_rom);
-        ESP_LOGI(TAG, "Max Speed Negative = %.3f m/s", state.max_v_neg);
-        ESP_LOGI(TAG, "Max Speed Positive = %.3f m/s", state.max_v_pos);
-        printf("\n");
-        printf("\n");
-        ESP_LOGI(TAG, "Stable condition.");
-}
-
-void evaluate_speed_decrement()
-{
-        float last_speed_decrement,
-              decrement_from_start;
-
-        if (state.reps_n < 2)
-                return;  // not enought elements to evaluate decrement 
-
-        int idx = state.reps_n - 1;
-
-        last_speed_decrement = ( 100 * state.reps_speed[idx] / state.reps_speed[idx - 1] ) - 100;
-
-        decrement_from_start = ( 100 * state.reps_speed[idx] / state.reps_speed[0] ) - 100;
-
-        ESP_LOGI(TAG, "speed decrement -> last: %d %%, from start: %d %%", 
-                 (int)last_speed_decrement, (int)decrement_from_start);
-        
-        if (state.reps_speed[idx] <= cfg.last_rep_speed_threshold)
-                ESP_LOGW(TAG, 
-                         "LOW SPEED LIMIT REACHED : %.3f m/s (limit:%.3f m/s)", 
-                         state.reps_speed[idx], 
-                         cfg.last_rep_speed_threshold);
-
-        printf ("\n");
-}
-
 void print_rep_speed_array()
 {
         printf("[ ");
@@ -250,126 +181,6 @@ void print_rep_speed_array()
                 printf("%.3f ", state.reps_speed[i]); 
         }
         printf("]\n");
-}
-
-void store_rep_speed(int rep, float v) 
-{
-        state.reps_speed[rep - 1] = fabsf(v);
-        /* print_rep_speed_array(); */
-        evaluate_speed_decrement();
-}
-
-void check_if_new_max_speed_reached()
-{
-        ESP_LOGV(TAG, "ds: %.3f m, dp: %d count, pulse: %d count, last pulse: %d count",
-                 state.ds, state.dp, state.pulse_count, state.last_pulse_count);
-
-        if (state.dp < 0) {
-                if (state.direction_switched) {
-                        /* ESP_LOGD(TAG, "new max speed negative %.3f", state.v); */
-                        state.reps_n++;
-                        /* state.rep_start_time = esp_timer_get_time(); */
-                        state.rep_start_time = state.d.start_pos_time;
-                        state.rep_start_s = (float) get_start_pos(&(state.d)) / (float) cfg.count_mt_coeff;
-
-                        ESP_LOGI(TAG, "storing start time: %lld us, start pos: %.3f", 
-                                        state.rep_start_time, state.rep_start_s);
-                }
-
-                state.rep_ongoing = true;
-        }
-
-        if (state.dp > 0) {
-                if (state.direction_switched) {
-                        state.max_neg_s = (float) state.pulse_count / (float) cfg.count_mt_coeff;
-                        state.rep_rom = state.max_neg_s - state.rep_start_s;
-
-                        state.rep_end_time = esp_timer_get_time();
-                        float delta_time_s =  (float) (state.rep_end_time - state.rep_start_time) / (1000*1000);
-
-                        ESP_LOGI(TAG, "storing end time: %lld us. delta_t: %.3f, end pos: %.3f", 
-                                        state.rep_end_time, 
-                                        delta_time_s,
-                                        state.max_neg_s);
-
-                        
-                        float rep_v = state.rep_rom / delta_time_s;       // m/s
-                                                                               
-                        ESP_LOGI(TAG, "rep n.%d rom: %.3f m, dt: %.3f s, speed: %.3f m/s", 
-                                        state.reps_n, 
-                                        state.rep_rom, 
-                                        delta_time_s, 
-                                        rep_v);
-
-                        store_rep_speed(state.reps_n, rep_v);
-                }
-
-                state.rep_ongoing = false;
-        }
-}
-
-void speed_evaluation()
-{
-        state.last_dp = state.dp;
-        state.dp = state.pulse_count - state.last_pulse_count;
-        state.ds = (float) state.dp / (float) cfg.count_mt_coeff;
-
-        int dir = dir_detector_update(&(state.d), state.pulse_count);
-
-        if (dir == 0) {
-                //printf("dir == 0 no movement. return\n");
-                return;
-        }
-
-
-        if (dir != state.last_dir) {
-                state.direction_switched =  true;
-                ESP_LOGD(TAG, "direction switched. last dp: %d, dp: %d",
-                                state.last_dp, state.dp);
-                state.last_dir = dir;
-        } else 
-                state.direction_switched = false;
-
-        check_if_new_max_speed_reached();
-}
-
-
-void periodic_pulse_count_evaluation()
-{
-        state.last_pulse_count = state.pulse_count;
-        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &state.pulse_count));
-
-        ESP_LOGD(TAG, "ROM = %.3f mt   [pulse count %d]", state.abs_s, state.pulse_count);
-
-        speed_evaluation();
-        return;
-
-        if (is_in_movement()) {
-                state.series_ongoing = true;
-                state.stability_count = 0;
-
-                state.abs_s = (float) state.pulse_count / (float) cfg.count_mt_coeff;
-
-                ESP_LOGD(TAG, "ROM = %.3f mt   [pulse count %d]", state.abs_s, state.pulse_count);
-
-                if (state.abs_s < state.max_neg_s)
-                        state.max_neg_s = state.abs_s;
-
-        } else {
-                state.stability_count++;
-
-                if (is_stable()) {               // is stable for enought time
-                        state.rep_rom = state.max_neg_s - state.rep_start_s;
-                        print_results();
-                        reset_state();
-                        state.rep_start_s = state.abs_s;
-                        ESP_LOGI(TAG, "new starting point %.3f m", state.rep_start_s);
-                        state.series_ongoing = false;
-                }
-
-        }
-
-        speed_evaluation();
 }
 
 void eval_elapsed_time()
@@ -383,23 +194,24 @@ void eval_elapsed_time()
         ESP_LOGV(TAG, "Periodic timer called, elapsed time from prev: %lld us", elapsed);
 }
 
-static void periodic_timer_callback(void* arg)
-{
-        eval_elapsed_time();
-        periodic_pulse_count_evaluation();
-}
-
 static void simple_periodic_timer_callback(void* arg)
 {
-        point p;
-        p.time = = esp_timer_get_time();
+        point_t p;
+
+        p.time = esp_timer_get_time();
         ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &p.pulse));
+
+        if (xQueueSend(xQueue, &p, pdMS_TO_TICKS(100)) == pdPASS) {
+                /* printf("sending %lld - %d\n", p.time, p.pulse); */
+        } else {
+                ESP_LOGE(TAG, "Queue full, failed to send");
+        }
 }
 
 void timer_init() 
 {
         const esp_timer_create_args_t periodic_timer_args = {
-                .callback = &periodic_timer_callback,
+                .callback = &simple_periodic_timer_callback,
                 .name = "periodic encoder poll"
         };
 
@@ -408,7 +220,18 @@ void timer_init()
         ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, cfg.dt*1000));
 }
 
-
+void vConsumerTask(void *pvParameters)
+{
+        point_t p;
+        for (;;) {
+                /* Wait indefinitely for data to arrive */
+                if (xQueueReceive(xQueue, &p, portMAX_DELAY) == pdPASS) {
+                        printf("%lld us | %d cnt\n", 
+                                        p.time - state.t_last, p.pulse);
+                        state.t_last = p.time;
+                }
+        }
+}
 
 void app_main(void)
 {
@@ -416,24 +239,12 @@ void app_main(void)
         /* esp_log_level_set(TAG, ESP_LOG_DEBUG); */
         /* esp_log_level_set(TAG, ESP_LOG_VERBOSE); */
 
-        QueueHandle_t queue = init_encoder();
+        xQueue = xQueueCreate(10, sizeof(point_t));
 
-        /* ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &state.last_pulse_count)); */
-
-        reset_state();
         timer_init();
 
         ESP_LOGI(TAG, "\n\nReady to Rock!\n");
 
-        while (1) {
-                if (xQueueReceive(queue, &state.event_count, pdMS_TO_TICKS(cfg.dt))) {
-                        /* ESP_LOGD(TAG, "Watch point event, count: %d", event_count); */
-                } else {
-                        /* periodic_pulse_count_evaluation(); */
-                }
-        }
+        xTaskCreatePinnedToCore(vConsumerTask, "ConsumerTask",
+                        4096, NULL, 2, NULL, 1); // run on core 1
 }
-
-
-
-
